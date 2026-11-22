@@ -1,0 +1,333 @@
+# Builds Rynuvo from the private source repo (rigelra15/rynuvo) at a release tag and publishes the
+# installers, updater bundles and latest.json as a GitHub Release here, in this public repo.
+#
+# Triggered by the source repo when a v* tag is pushed (repository_dispatch, type "release"), or by
+# hand from the Actions tab with the tag to build.
+#
+# THIS REPO IS PUBLIC: every log line and artifact of these runs is public. Never echo a secret, and
+# never print source: build output goes to a file and only error headlines (no code frames) are shown.
+name: Release
+
+on:
+  repository_dispatch:
+    types: [release]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag in rigelra15/rynuvo to build (e.g. v0.14.0)
+        required: true
+      notes:
+        description: Release notes (also shown by the in-app updater)
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_REPO: rigelra15/rynuvo
+  TAG: ${{ github.event.client_payload.tag || inputs.tag }}
+  NOTES: ${{ github.event.client_payload.notes || inputs.notes }}
+
+concurrency:
+  group: release-${{ github.event.client_payload.tag || inputs.tag }}
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bundle: app,dmg
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundle: nsis
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Tag is a version tag
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::'$TAG' is not a vX.Y.Z tag"; exit 1; }
+
+      # The private source, read with a read-only deploy key; the key is not left in .git/config.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: refs/tags/${{ env.TAG }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.5.2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Runs here are always on this repo's default branch, so each release saves the cache the next restores.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: desktop-${{ matrix.target }}
+
+      # Windows Defender scans every file the compiler writes; off for this throwaway runner.
+      - name: Faster disk on Windows
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        continue-on-error: true
+        run: Set-MpPreference -DisableRealtimeMonitoring $true
+
+      - name: Read version
+        id: v
+        run: echo "version=$(node -p "require('./apps/desktop/src-tauri/tauri.conf.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Tag matches app version
+        run: |
+          [ "$TAG" = "v${{ steps.v.outputs.version }}" ] || {
+            echo "::error::Tag $TAG does not match tauri.conf.json version ${{ steps.v.outputs.version }}"; exit 1; }
+
+      - name: Install frontend deps
+        working-directory: apps/desktop
+        run: pnpm install --frozen-lockfile
+
+      # Tauri's own APPLE_CERTIFICATE import only accepts trusted (Apple-issued) identities, so the
+      # self-signed certificate goes into a keychain here and Tauri gets just its name.
+      - name: Import Mac signing certificate
+        if: matrix.os == 'macos-latest'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          kc="$RUNNER_TEMP/signing.keychain-db"; kp=$(openssl rand -hex 16)
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$kp" "$kc"
+          security set-keychain-settings -t 3600 -u "$kc"
+          security unlock-keychain -p "$kp" "$kc"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign > /dev/null
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kp" "$kc" > /dev/null
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/cert.p12"
+          security find-identity -p codesigning "$kc"
+
+      - name: Build
+        working-directory: apps/desktop
+        env:
+          # Signs the updater bundles (the key has no password).
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+          # macOS: one fixed self-signed certificate, so every version is the same app to macOS and
+          # Screen Recording / Microphone permissions survive updates (ad-hoc signing loses them).
+          APPLE_SIGNING_IDENTITY: ${{ matrix.os == 'macos-latest' && secrets.APPLE_SIGNING_IDENTITY || '' }}
+        run: |
+          log="$RUNNER_TEMP/build.log"
+          if ! pnpm tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundle }} > "$log" 2>&1; then
+            echo "::error::Build failed. Full output is kept off this public log; build the tag locally for details."
+            grep -E '^(error|Error)|^ *--> ' "$log" | head -40 || true
+            exit 1
+          fi
+          echo "built"
+
+      - name: Mac app is signed with the Rynuvo certificate
+        if: matrix.os == 'macos-latest'
+        run: |
+          app=$(ls -d target/${{ matrix.target }}/release/bundle/macos/*.app)
+          codesign -d -r- "$app" 2>&1 | grep -q 'certificate root' || {
+            echo "::error::the app is not signed with the certificate (permissions would reset on update)"; exit 1; }
+
+      # A fresh Windows has no Visual C++ runtime: the exe must not need one (.cargo/config.toml).
+      - name: No Visual C++ runtime DLLs needed
+        if: matrix.os == 'windows-latest'
+        run: |
+          exe=target/${{ matrix.target }}/release/rynuvo-desktop.exe
+          if grep -aiqE "msvcp140|vcruntime140" "$exe"; then
+            echo "::error::the exe needs the Visual C++ runtime (MSVCP140/VCRUNTIME140)"; exit 1; fi
+
+      - name: Collect installer and updater bundle
+        run: |
+          mkdir -p out
+          b=target/${{ matrix.target }}/release/bundle
+          name="Rynuvo-${{ steps.v.outputs.version }}"
+          if [ "${{ matrix.os }}" = macos-latest ]; then
+            cp "$(ls $b/dmg/*.dmg | head -1)" "out/$name-mac.dmg"
+            cp $b/macos/*.app.tar.gz "out/$name-mac.app.tar.gz"
+            cp $b/macos/*.app.tar.gz.sig "out/$name-mac.app.tar.gz.sig"
+          else
+            src=$(ls $b/nsis/*-setup.exe | head -1)
+            cp "$src" "out/$name-windows-setup.exe"
+            cp "$src.sig" "out/$name-windows-setup.exe.sig"
+          fi
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.target }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 3
+
+  android:
+    # The phone build: one signed arm64 APK, plus its updater signature (the app checks the APK
+    # against the same key as desktop updates before handing it to Android's installer).
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Tag is a version tag
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::'$TAG' is not a vX.Y.Z tag"; exit 1; }
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: refs/tags/${{ env.TAG }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.5.2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+          cache-dependency-path: apps/desktop/src-tauri/gen/android/**/*.gradle*
+
+      # The runner image already carries the Android SDK (ANDROID_HOME) and its sdkmanager.
+      - name: Install the NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;29.0.13599879" > /dev/null
+          nd="$ANDROID_HOME/ndk/29.0.13599879"
+          { echo "NDK_HOME=$nd"; echo "ANDROID_NDK=$nd"; echo "ANDROID_NDK_ROOT=$nd"; } >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: android-aarch64
+
+      - name: Read version
+        id: v
+        run: echo "version=$(node -p "require('./apps/desktop/src-tauri/tauri.conf.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Tag matches app version
+        run: |
+          [ "$TAG" = "v${{ steps.v.outputs.version }}" ] || {
+            echo "::error::Tag $TAG does not match tauri.conf.json version ${{ steps.v.outputs.version }}"; exit 1; }
+
+      - name: Install frontend deps
+        working-directory: apps/desktop
+        run: pnpm install --frozen-lockfile
+
+      # The same release key every time, or phones refuse the APK as an update.
+      - name: Release keystore
+        env:
+          ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+        run: |
+          echo "$ANDROID_KEYSTORE" | base64 --decode > "$RUNNER_TEMP/release.jks"
+          echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+
+      - name: Build
+        working-directory: apps/desktop
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          log="$RUNNER_TEMP/build.log"
+          if ! pnpm tauri android build --apk --target aarch64 > "$log" 2>&1; then
+            echo "::error::Build failed. Full output is kept off this public log; build the tag locally for details."
+            grep -E '^(error|Error|FAILURE)|^ *--> ' "$log" | head -40 || true
+            exit 1
+          fi
+          echo "built"
+
+      - name: Collect APK and its updater signature
+        working-directory: apps/desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        run: |
+          mkdir -p ../../out
+          apk=$(ls src-tauri/gen/android/app/build/outputs/apk/*/release/*.apk | head -1)
+          out="../../out/Rynuvo-${{ steps.v.outputs.version }}-android.apk"
+          cp "$apk" "$out"
+          "$ANDROID_HOME"/build-tools/*/apksigner verify "$out" || true
+          pnpm tauri signer sign "$out" > /dev/null
+          ls -lh ../../out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-aarch64
+          path: out/*
+          if-no-files-found: error
+          retention-days: 3
+
+  release:
+    needs: [desktop, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # What installed apps poll (tauri.conf.json updater endpoint, apk_update.rs): this repo's
+      # releases/latest/download/latest.json.
+      - name: Updater manifest
+        run: |
+          v="${TAG#v}"
+          for f in mac.dmg mac.app.tar.gz mac.app.tar.gz.sig windows-setup.exe windows-setup.exe.sig android.apk android.apk.sig; do
+            [ -f "dist/Rynuvo-$v-$f" ] || { echo "::error::missing Rynuvo-$v-$f"; exit 1; }
+          done
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          V="$v" BASE="$base" NOTES="${NOTES:-Rynuvo $v}" python3 - <<'PY'
+          import json, os, datetime
+          v, base = os.environ["V"], os.environ["BASE"]
+          sig = lambda f: open(f"dist/{f}").read().strip()
+          doc = {
+              "version": v,
+              "notes": os.environ["NOTES"],
+              "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "platforms": {
+                  "darwin-aarch64": {"url": f"{base}/Rynuvo-{v}-mac.app.tar.gz", "signature": sig(f"Rynuvo-{v}-mac.app.tar.gz.sig")},
+                  "windows-x86_64": {"url": f"{base}/Rynuvo-{v}-windows-setup.exe", "signature": sig(f"Rynuvo-{v}-windows-setup.exe.sig")},
+                  # Not a Tauri updater target: the Android app reads this entry itself (apk_update.rs).
+                  "android-aarch64": {"url": f"{base}/Rynuvo-{v}-android.apk", "signature": sig(f"Rynuvo-{v}-android.apk.sig")},
+              },
+          }
+          json.dump(doc, open("dist/latest.json", "w"), indent=2)
+          PY
+          # Version-free names, so releases/latest/download/Rynuvo-latest-mac.dmg is a stable download link.
+          cp "dist/Rynuvo-$v-mac.dmg" dist/Rynuvo-latest-mac.dmg
+          cp "dist/Rynuvo-$v-windows-setup.exe" dist/Rynuvo-latest-windows-setup.exe
+          cp "dist/Rynuvo-$v-android.apk" dist/Rynuvo-latest-android.apk
+          ls -lh dist
+
+      # gh uploads every asset to a draft and only then publishes it, so latest.json never points
+      # at files that aren't there yet.
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Rynuvo $TAG" --notes "${NOTES:-Rynuvo ${TAG#v}}"
