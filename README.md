@@ -8,6 +8,6 @@ Latest version:
 - Windows: [Rynuvo-latest-windows-setup.exe](https://github.com/rigelra15/rynuvo-releases/releases/latest/download/Rynuvo-latest-windows-setup.exe)
 - Android: [Rynuvo-latest-android.apk](https://github.com/rigelra15/rynuvo-releases/releases/latest/download/Rynuvo-latest-android.apk)
 
-Installed apps update themselves from `releases/latest/download/latest.json`.
+Installed apps update themselves from rynuvo.pokyvl.my.id, which each release here also publishes to.
 
 All versions: [Releases](https://github.com/rigelra15/rynuvo-releases/releases).

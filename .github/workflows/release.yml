@@ -331,3 +331,38 @@ jobs:
           gh release create "$TAG" dist/* \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "Rynuvo $TAG" --notes "${NOTES:-Rynuvo ${TAG#v}}"
+
+      # Installed apps poll the VPS (rynuvo.pokyvl.my.id/downloads/latest.json): the same files go
+      # there with a latest.json that points at them. The CI key can only run the VPS's
+      # rynuvo-ci-receive (a forced command), which puts latest.json in place last.
+      - name: Publish on the VPS
+        env:
+          KEY: ${{ secrets.VPS_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+          TARGET: ${{ secrets.VPS_TARGET }}
+        run: |
+          v="${TAG#v}"
+          mkdir vps
+          cp dist/Rynuvo-* vps/
+          V="$v" BASE="https://rynuvo.pokyvl.my.id/downloads" NOTES="${NOTES:-Rynuvo $v}" python3 - <<'PY'
+          import json, os
+          doc = json.load(open("dist/latest.json"))
+          v, base = os.environ["V"], os.environ["BASE"]
+          for p in doc["platforms"].values():
+              p["url"] = f"{base}/" + p["url"].rsplit("/", 1)[1]
+          json.dump(doc, open("vps/latest.json", "w"), indent=2)
+          PY
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/ci && chmod 600 ~/.ssh/ci
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          (cd vps && tar -cf - -- *) | ssh -i ~/.ssh/ci -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o BatchMode=yes "$TARGET"
+          rm -f ~/.ssh/ci
+
+      - name: Live on the VPS
+        run: |
+          for _ in 1 2 3 4 5 6; do
+            curl -fsS https://rynuvo.pokyvl.my.id/downloads/latest.json | grep -q "\"version\": \"${TAG#v}\"" && { echo "Rynuvo $TAG is live"; exit 0; }
+            sleep 5
+          done
+          echo "latest.json on the VPS isn't on $TAG" >&2
+          exit 1
