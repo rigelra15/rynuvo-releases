@@ -27,6 +27,8 @@ env:
   SOURCE_REPO: rigelra15/rynuvo
   TAG: ${{ github.event.client_payload.tag || inputs.tag }}
   NOTES: ${{ github.event.client_payload.notes || inputs.notes }}
+  # The GIF picker's KLIPY key (baked into the app; KLIPY wants calls from the app itself). Unset: no GIF button.
+  VITE_KLIPY_KEY: ${{ secrets.KLIPY_KEY }}
 
 concurrency:
   group: release-${{ github.event.client_payload.tag || inputs.tag }}
